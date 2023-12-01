@@ -1,0 +1,180 @@
+SET TIMEZONE TO 'US/PACIFIC';
+DROP TABLE IF EXISTS console_query_variables;
+CREATE TEMP TABLE console_query_variables AS
+SELECT
+    -- Date filter for whole query --> What dates range are we looking to pull?
+    '2023-10-01 00:00:00'::timestamp AS query_start_timestamp_filter,
+    '2023-12-31 00:00:00'::timestamp AS query_end_timestamp_filter,
+    -- Date filter for source tables --> Given the above date range, what date ranges
+    -- on the source tables should we look through?
+    '2021-06-01 00:00:00'::timestamp AS source_tables_start_timestamp_filter,
+    '2023-12-31 00:00:00'::timestamp AS source_tables_end_timestamp_filter,
+    -16 AS fuzzymatchmin,     --DAYS
+    6 AS fuzzymatchmax       --MONTHS
+;
+
+
+drop table iF exists Track_Detail;
+Create temp table Track_Detail as
+Select
+    transaction_id,
+    TR.carrier_dim_id,
+    carrier_name,
+    user_dim_id,
+    first_event_date_dim_id as  First_Event_date,
+    last_event_date_dim_id as Last_Event_date,
+    first_scan_date_dim_id as First_Scan_date,
+    delivery_date_dim_id as Delivery_date,
+    actual_days_in_transit,
+    TR.track_status_dim_id,track_status_name
+from prod.track_fact TR
+         left join prod.track_status_dim TS on TR.track_status_dim_id=TS.track_status_dim_id
+         left join prod.carrier_dim CAD on TR.carrier_dim_id = CAD.carrier_dim_id
+WHERE
+    (TR.create_date >= (select source_tables_start_timestamp_filter from console_query_variables)
+        AND TR.create_date < (select source_tables_end_timestamp_filter from console_query_variables))
+  AND (
+         cad.provider_id in ('17') or cad.carrier_name in ('USPS')
+    );
+
+
+drop table USPS_Transactions;
+Create table USPS_Transactions as
+SELECT
+    distinct lf.transaction_id,
+
+-- Amount Fields
+             lf.postage_est_cost_usd                 est_postage_cost,
+             lf.postage_cost_usd                     actual_postage_cost,
+             -- Postage price usd = rate.amount (user rate)
+             lf.postage_price_usd                    user_rate,
+             -- Missin invoice charge, invoice refund (replicatd with case statements below)
+             -- Missing insurance amount
+             -- Per Calvin 20220401, the fee merchant pays for insurance
+             lf.insurance_price_usd                  insurance_fee,
+             -- Per Calvin, the cost Shippo pays insurer
+             lf.insurance_cost_usd                   insurance_cost,
+             -- Missing all recon table fields (only in prod)
+             -- <<REDSHIFT SPECIFIC FIELDS BELOW>>
+             lf.invoiced_amount_usd                  inv_amount,
+             lf.invoiced_paid_usd                    inv_paid,
+-- Attribute Fields
+             --zd.zone_name,
+             -- Missing txn object state
+             -- Missing txn object status
+             lf.tracking_number,
+             emd.entry_method_type,
+             -- Missing scan form id
+             ptd.is_return,
+             -- Missing return of id
+             -- Missing submission id
+             mtd.manifest_type,
+             -- Missing ship submission type
+             sld.service_level_name,
+             -- Note cad.provider_id is broken per Calvin must use cd. only
+             cd.provider_id,
+             cd.carrier_name,
+             cad.master_carrier_account_id,
+             cad.carrier_account_id,
+             cad.master_carrier_ext_account_id,
+             rsd.refund_status                       shippo_refund,
+             crsd.carrier_refund_status,
+             -- <<REDSHIFT SPECIFIC FIELDS BELOW>>
+             cad.carrier_own_account_indicator,
+             ud.company_name,
+             ptd.parcel_type,
+             ttd.transaction_type,
+             rtd.refund_type,
+             lf.orig_transaction_id,
+             lf.reconcile_subgrp_ext_id,
+             --user_dim_id as user_id,
+             --lf.invoice_id,
+
+
+-- Transaction Type (need to determine inv chrg/ refund)
+             CASE
+                 WHEN (rsd.refund_status IS NOT NULL OR ttd.transaction_type = 'Refund') AND ptd.parcel_type = 'return' THEN 'return/refund'
+                 WHEN (rsd.refund_status IS NOT NULL OR ttd.transaction_type = 'Refund') THEN 'outbound/refund'
+                 WHEN ptd.parcel_type = 'return' THEN 'return'
+                 ELSE 'outbound'
+                 END                              AS cust_transaction_type,
+
+-- Determine 'Subscription w/o label' or show Transaction Type
+             CASE
+                 WHEN ttd.transaction_type = 'Dummy Label' THEN 'Subscription w/o Label'
+                 ELSE ttd.transaction_type
+                 END                              AS trx_type,
+
+
+-- Date fields
+             --to_char(pdd.full_date, 'YYYY-MM-DD') AS purchase_date,
+             to_char(pdd.full_date, 'MON-YY')     AS purchase_date_mon,
+             to_date(pdd.full_date, 'YYYY-MM-DD',FALSE) as purchase_date,
+             --to_date(approve_time, 'YYYY-MM-DD',FALSE) as refund_date,
+             --INV.Refund_date as Refund_date,
+             track_status_dim_id,
+             track_status_name,
+             weight_lb,
+             frmaddr.postal_code as Origin,
+             toaddr.postal_code as Destination,
+             zone_name,
+             cast(length_mm as varchar) as length,
+            cast(width_mm as varchar) as width,
+            cast(height_mm as varchar) as height
+
+
+-- Main LABEL FACT (LF) TABLE
+FROM prod.label_fact lf
+
+-- JOINS
+         LEFT JOIN prod.carrier_account_dim cad ON lf.carrier_account_dim_id = cad.carrier_account_dim_id
+        left join prod.zone_dim ZD on lf.zone_dim_id=ZD.zone_dim_id
+
+         LEFT JOIN prod.carrier_dim cd ON lf.carrier_dim_id = cd.carrier_dim_id
+         LEFT JOIN prod.parcel_type_dim ptd ON lf.parcel_type_dim_id = ptd.parcel_type_dim_id
+         LEFT JOIN prod.date_dim pdd ON lf.purchase_date_dim_id = pdd.date_dim_id
+         LEFT JOIN prod.service_level_dim sld ON lf.service_level_dim_id = sld.service_level_dim_id
+         LEFT JOIN prod.user_dim ud ON lf.user_dim_id = ud.user_dim_id
+         LEFT JOIN prod.transaction_type_dim ttd ON lf.transaction_type_dim_id = ttd.transaction_type_dim_id
+         LEFT JOIN prod.entry_method_dim emd ON lf.entry_method_dim_id = emd.entry_method_dim_id
+         LEFT JOIN prod.manifest_type_dim mtd ON lf.manifest_type_dim_id = mtd.manifest_type_dim_id
+         LEFT JOIN prod.carrier_refund_status_dim crsd ON lf.carrier_refund_status_dim_id = crsd.carrier_refund_status_dim_id
+         LEFT JOIN prod.refund_type_dim rtd ON lf.refund_type_dim_id = rtd.refund_type_dim_id
+         LEFT JOIN prod.refund_status_dim rsd ON lf.refund_status_dim_id = rsd.refund_status_dim_id
+         left join Track_Detail TR on lf.transaction_id=TR.transaction_id
+         LEFT JOIN prod.postal_code_dim frmaddr ON lf.source_zip_dim_id = frmaddr.postal_code_dim_id
+         LEFT JOIN prod.postal_code_dim toaddr ON lf.dest_zip_dim_id = toaddr.postal_code_dim_id
+WHERE lf.purchase_date_dim_id >= '20231015'
+  --(select query_start_timestamp_filter from console_query_variables)
+  AND lf.purchase_date_dim_id <= '20231231'
+  -- (select query_end_timestamp_filter from console_query_variables)
+  AND (
+           cad.provider_id in ('17') or cad.carrier_name in ('USPS'))
+  AND (ud.company_name NOT ILIKE ('%goshippo.com%')
+    AND ud.company_name NOT ILIKE ('%Popout%')
+    AND ud.company_name NOT ILIKE ('Shippo%'))
+
+-- Type Specific CASE SENSITIVE
+  AND ttd.transaction_type NOT IN ('Surcharge')
+ORDER BY lf.transaction_id;
+
+
+
+select service_level_name as "Service Name",
+       tracking_number as "Tracking Number",
+       track_status_name as "label Status",
+       purchase_date as "Purchase Date",
+       user_rate as "Shippo cost",
+       actual_postage_cost*-1 as "Shippo Charged" ,
+       Origin,
+       Destination,
+       zone_name as Zone,
+       weight_lb as "parcel_weight(lbs)",
+       round((length/25.4),0)||' X '||round((width/25.4),0)||' X '|| round((height/25.4),0) as  "Parcel_Dimensions(L X W X H)"
+from USPS_Transactions
+where  "Shippo cost"<"Shippo Charged"
+and parcel_type='outbound'  and transaction_type='Purchase'
+and service_level_name in ('Priority Mail','Ground Advantage')
+and purchase_date>='2023-11-01'
+and purchase_date<='2023-11-25'
+order by "Shippo cost" desc
